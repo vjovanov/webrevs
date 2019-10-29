@@ -1,0 +1,642 @@
+<?xml version="1.0"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+<head><meta charset="utf-8">
+<meta http-equiv="cache-control" content="no-cache" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="-1" />
+<!--
+   Note to customizers: the body of the webrev is IDed as SUNWwebrev
+   to allow easy overriding by users of webrev via the userContent.css
+   mechanism available in some browsers.
+
+   For example, to have all "removed" information be red instead of
+   brown, set a rule in your userContent.css file like:
+
+       body#SUNWwebrev span.removed { color: red ! important; }
+-->
+<style type="text/css" media="screen">
+body {
+    background-color: #eeeeee;
+}
+hr {
+    border: none 0;
+    border-top: 1px solid #aaa;
+    height: 1px;
+}
+div.summary {
+    font-size: .8em;
+    border-bottom: 1px solid #aaa;
+    padding-left: 1em;
+    padding-right: 1em;
+}
+div.summary h2 {
+    margin-bottom: 0.3em;
+}
+div.summary table th {
+    text-align: right;
+    vertical-align: top;
+    white-space: nowrap;
+}
+span.lineschanged {
+    font-size: 0.7em;
+}
+span.oldmarker {
+    color: red;
+    font-size: large;
+    font-weight: bold;
+}
+span.newmarker {
+    color: green;
+    font-size: large;
+    font-weight: bold;
+}
+span.removed {
+    color: brown;
+}
+span.changed {
+    color: blue;
+}
+span.new {
+    color: blue;
+    font-weight: bold;
+}
+a.print { font-size: x-small; }
+
+</style>
+
+<style type="text/css" media="print">
+pre { font-size: 0.8em; font-family: courier, monospace; }
+span.removed { color: #444; font-style: italic }
+span.changed { font-weight: bold; }
+span.new { font-weight: bold; }
+span.newmarker { font-size: 1.2em; font-weight: bold; }
+span.oldmarker { font-size: 1.2em; font-weight: bold; }
+a.print {display: none}
+hr { border: none 0; border-top: 1px solid #aaa; height: 1px; }
+</style>
+
+<title>New src/java.base/share/classes/java/lang/invoke/InnerClassLambdaMetafactory.java</title>
+<body id="SUNWwebrev">
+<pre>
+   1 /*
+   2  * Copyright (c) 2012, 2013, Oracle and/or its affiliates. All rights reserved.
+   3  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+   4  *
+   5  * This code is free software; you can redistribute it and/or modify it
+   6  * under the terms of the GNU General Public License version 2 only, as
+   7  * published by the Free Software Foundation.  Oracle designates this
+   8  * particular file as subject to the "Classpath" exception as provided
+   9  * by Oracle in the LICENSE file that accompanied this code.
+  10  *
+  11  * This code is distributed in the hope that it will be useful, but WITHOUT
+  12  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  13  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+  14  * version 2 for more details (a copy is included in the LICENSE file that
+  15  * accompanied this code).
+  16  *
+  17  * You should have received a copy of the GNU General Public License version
+  18  * 2 along with this work; if not, write to the Free Software Foundation,
+  19  * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+  20  *
+  21  * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+  22  * or visit www.oracle.com if you need additional information or have any
+  23  * questions.
+  24  */
+  25 
+  26 package java.lang.invoke;
+  27 
+  28 import jdk.internal.org.objectweb.asm.*;
+  29 import sun.invoke.util.BytecodeDescriptor;
+  30 import jdk.internal.misc.Unsafe;
+  31 import sun.security.action.GetPropertyAction;
+  32 
+  33 import java.io.FilePermission;
+  34 import java.io.Serializable;
+  35 import java.security.AccessController;
+  36 import java.security.PrivilegedAction;
+  37 import java.util.LinkedHashSet;
+  38 import java.util.concurrent.atomic.AtomicInteger;
+  39 import java.util.PropertyPermission;
+  40 import java.util.Set;
+  41 
+  42 import static jdk.internal.org.objectweb.asm.Opcodes.*;
+  43 
+  44 /**
+  45  * Lambda metafactory implementation which dynamically creates an
+  46  * inner-class-like class per lambda callsite.
+  47  *
+  48  * @see LambdaMetafactory
+  49  */
+  50 /* package */ final class InnerClassLambdaMetafactory extends AbstractValidatingLambdaMetafactory {
+  51     private static final Unsafe UNSAFE = Unsafe.getUnsafe();
+  52 
+  53     private static final int CLASSFILE_VERSION = 52;
+  54     private static final String METHOD_DESCRIPTOR_VOID = Type.getMethodDescriptor(Type.VOID_TYPE);
+  55     private static final String JAVA_LANG_OBJECT = "java/lang/Object";
+  56     private static final String NAME_CTOR = "&lt;init&gt;";
+  57     private static final String NAME_FACTORY = "get$Lambda";
+  58     private static final String LAMBDA_INSTANCE_FIELD = "LAMBDA_INSTANCE$";
+  59 
+  60     //Serialization support
+  61     private static final String NAME_SERIALIZED_LAMBDA = "java/lang/invoke/SerializedLambda";
+  62     private static final String NAME_NOT_SERIALIZABLE_EXCEPTION = "java/io/NotSerializableException";
+  63     private static final String DESCR_METHOD_WRITE_REPLACE = "()Ljava/lang/Object;";
+  64     private static final String DESCR_METHOD_WRITE_OBJECT = "(Ljava/io/ObjectOutputStream;)V";
+  65     private static final String DESCR_METHOD_READ_OBJECT = "(Ljava/io/ObjectInputStream;)V";
+  66     private static final String NAME_METHOD_WRITE_REPLACE = "writeReplace";
+  67     private static final String NAME_METHOD_READ_OBJECT = "readObject";
+  68     private static final String NAME_METHOD_WRITE_OBJECT = "writeObject";
+  69 
+  70     private static final String DESCR_CLASS = "Ljava/lang/Class;";
+  71     private static final String DESCR_STRING = "Ljava/lang/String;";
+  72     private static final String DESCR_OBJECT = "Ljava/lang/Object;";
+  73     private static final String DESCR_CTOR_SERIALIZED_LAMBDA
+  74             = "(" + DESCR_CLASS + DESCR_STRING + DESCR_STRING + DESCR_STRING + "I"
+  75             + DESCR_STRING + DESCR_STRING + DESCR_STRING + DESCR_STRING + "[" + DESCR_OBJECT + ")V";
+  76 
+  77     private static final String DESCR_CTOR_NOT_SERIALIZABLE_EXCEPTION = "(Ljava/lang/String;)V";
+  78     private static final String[] SER_HOSTILE_EXCEPTIONS = new String[] {NAME_NOT_SERIALIZABLE_EXCEPTION};
+  79 
+  80     private static final String DESCR_HIDDEN = "Ljdk/internal/vm/annotation/Hidden;";
+  81 
+  82     private static final String[] EMPTY_STRING_ARRAY = new String[0];
+  83 
+  84     // Used to ensure that each spun class name is unique
+  85     private static final AtomicInteger counter = new AtomicInteger(0);
+  86 
+  87     // For dumping generated classes to disk, for debugging purposes
+  88     private static final ProxyClassesDumper dumper;
+  89 
+  90     // initialize lambdas eagerly for better startup performance
+  91     private static final boolean eagerlyInitialize;
+  92 
+  93     static {
+  94         final String dumpKey = "jdk.internal.lambda.dumpProxyClasses";
+  95         String path = GetPropertyAction.privilegedGetProperty(dumpKey);
+  96         dumper = (null == path) ? null : ProxyClassesDumper.getInstance(path);
+  97 
+  98         final String eagerlyInitializeKey = "jdk.internal.lambda.eagerlyInitialize";
+  99         String eagerlyInitializeSetting = GetPropertyAction.privilegedGetProperty(eagerlyInitializeKey);
+ 100         eagerlyInitialize = !"false".equals(eagerlyInitializeSetting);
+ 101     }
+ 102 
+ 103     // See context values in AbstractValidatingLambdaMetafactory
+ 104     private final String implMethodClassName;        // Name of type containing implementation "CC"
+ 105     private final String implMethodName;             // Name of implementation method "impl"
+ 106     private final String implMethodDesc;             // Type descriptor for implementation methods "(I)Ljava/lang/String;"
+ 107     private final MethodType constructorType;        // Generated class constructor type "(CC)void"
+ 108     private final ClassWriter cw;                    // ASM class writer
+ 109     private final String[] argNames;                 // Generated names for the constructor arguments
+ 110     private final String[] argDescs;                 // Type descriptors for the constructor arguments
+ 111     private final String lambdaClassName;            // Generated name for the generated class "X$$Lambda$1"
+ 112 
+ 113     /**
+ 114      * General meta-factory constructor, supporting both standard cases and
+ 115      * allowing for uncommon options such as serialization or bridging.
+ 116      *
+ 117      * @param caller Stacked automatically by VM; represents a lookup context
+ 118      *               with the accessibility privileges of the caller.
+ 119      * @param invokedType Stacked automatically by VM; the signature of the
+ 120      *                    invoked method, which includes the expected static
+ 121      *                    type of the returned lambda object, and the static
+ 122      *                    types of the captured arguments for the lambda.  In
+ 123      *                    the event that the implementation method is an
+ 124      *                    instance method, the first argument in the invocation
+ 125      *                    signature will correspond to the receiver.
+ 126      * @param samMethodName Name of the method in the functional interface to
+ 127      *                      which the lambda or method reference is being
+ 128      *                      converted, represented as a String.
+ 129      * @param samMethodType Type of the method in the functional interface to
+ 130      *                      which the lambda or method reference is being
+ 131      *                      converted, represented as a MethodType.
+ 132      * @param implMethod The implementation method which should be called (with
+ 133      *                   suitable adaptation of argument types, return types,
+ 134      *                   and adjustment for captured arguments) when methods of
+ 135      *                   the resulting functional interface instance are invoked.
+ 136      * @param instantiatedMethodType The signature of the primary functional
+ 137      *                               interface method after type variables are
+ 138      *                               substituted with their instantiation from
+ 139      *                               the capture site
+ 140      * @param isSerializable Should the lambda be made serializable?  If set,
+ 141      *                       either the target type or one of the additional SAM
+ 142      *                       types must extend {@code Serializable}.
+ 143      * @param markerInterfaces Additional interfaces which the lambda object
+ 144      *                       should implement.
+ 145      * @param additionalBridges Method types for additional signatures to be
+ 146      *                          bridged to the implementation method
+ 147      * @throws LambdaConversionException If any of the meta-factory protocol
+ 148      * invariants are violated
+ 149      */
+ 150     public InnerClassLambdaMetafactory(MethodHandles.Lookup caller,
+ 151                                        MethodType invokedType,
+ 152                                        String samMethodName,
+ 153                                        MethodType samMethodType,
+ 154                                        MethodHandle implMethod,
+ 155                                        MethodType instantiatedMethodType,
+ 156                                        boolean isSerializable,
+ 157                                        Class&lt;?&gt;[] markerInterfaces,
+ 158                                        MethodType[] additionalBridges)
+ 159             throws LambdaConversionException {
+ 160         super(caller, invokedType, samMethodName, samMethodType,
+ 161               implMethod, instantiatedMethodType,
+ 162               isSerializable, markerInterfaces, additionalBridges);
+ 163         implMethodClassName = implClass.getName().replace('.', '/');
+ 164         implMethodName = implInfo.getName();
+ 165         implMethodDesc = implInfo.getMethodType().toMethodDescriptorString();
+ 166         constructorType = invokedType.changeReturnType(Void.TYPE);
+ 167         lambdaClassName = targetClass.getName().replace('.', '/') + "$$Lambda$" + counter.incrementAndGet();
+ 168         cw = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+ 169         int parameterCount = invokedType.parameterCount();
+ 170         if (parameterCount &gt; 0) {
+ 171             argNames = new String[parameterCount];
+ 172             argDescs = new String[parameterCount];
+ 173             for (int i = 0; i &lt; parameterCount; i++) {
+ 174                 argNames[i] = "arg$" + (i + 1);
+ 175                 argDescs[i] = BytecodeDescriptor.unparse(invokedType.parameterType(i));
+ 176             }
+ 177         } else {
+ 178             argNames = argDescs = EMPTY_STRING_ARRAY;
+ 179         }
+ 180     }
+ 181 
+ 182     /**
+ 183      * Build the CallSite. Generate a class file which implements the functional
+ 184      * interface, define the class, if there are no parameters create an instance
+ 185      * of the class which the CallSite will return, otherwise, generate handles
+ 186      * which will call the class' constructor.
+ 187      *
+ 188      * @return a CallSite, which, when invoked, will return an instance of the
+ 189      * functional interface
+ 190      * @throws LambdaConversionException If properly formed functional interface
+ 191      * is not found
+ 192      */
+ 193     @Override
+ 194     CallSite buildCallSite() throws LambdaConversionException {
+ 195         final Class&lt;?&gt; innerClass = spinInnerClass();
+ 196         try {
+ 197             if (eagerlyInitialize) {
+ 198                 UNSAFE.ensureClassInitialized(innerClass);
+ 199             }
+ 200             MethodHandle lambdaHandle = invokedType.parameterCount() == 0
+ 201                     ? MethodHandles.Lookup.IMPL_LOOKUP.findStaticGetter(innerClass, LAMBDA_INSTANCE_FIELD, invokedType.returnType())
+ 202                     : MethodHandles.Lookup.IMPL_LOOKUP.findStatic(innerClass, NAME_FACTORY, invokedType);
+ 203 
+ 204             return new ConstantCallSite(lambdaHandle);
+ 205         }
+ 206         catch (ReflectiveOperationException e) {
+ 207             throw new LambdaConversionException("Exception finding lambda ", e);
+ 208         }
+ 209     }
+ 210 
+ 211     /**
+ 212      * Generate a class file which implements the functional
+ 213      * interface, define and return the class.
+ 214      *
+ 215      * @implNote The class that is generated does not include signature
+ 216      * information for exceptions that may be present on the SAM method.
+ 217      * This is to reduce classfile size, and is harmless as checked exceptions
+ 218      * are erased anyway, no one will ever compile against this classfile,
+ 219      * and we make no guarantees about the reflective properties of lambda
+ 220      * objects.
+ 221      *
+ 222      * @return a Class which implements the functional interface
+ 223      * @throws LambdaConversionException If properly formed functional interface
+ 224      * is not found
+ 225      */
+ 226     private Class&lt;?&gt; spinInnerClass() throws LambdaConversionException {
+ 227         String[] interfaces;
+ 228         String samIntf = samBase.getName().replace('.', '/');
+ 229         boolean accidentallySerializable = !isSerializable &amp;&amp; Serializable.class.isAssignableFrom(samBase);
+ 230         if (markerInterfaces.length == 0) {
+ 231             interfaces = new String[]{samIntf};
+ 232         } else {
+ 233             // Assure no duplicate interfaces (ClassFormatError)
+ 234             Set&lt;String&gt; itfs = new LinkedHashSet&lt;&gt;(markerInterfaces.length + 1);
+ 235             itfs.add(samIntf);
+ 236             for (Class&lt;?&gt; markerInterface : markerInterfaces) {
+ 237                 itfs.add(markerInterface.getName().replace('.', '/'));
+ 238                 accidentallySerializable |= !isSerializable &amp;&amp; Serializable.class.isAssignableFrom(markerInterface);
+ 239             }
+ 240             interfaces = itfs.toArray(new String[itfs.size()]);
+ 241         }
+ 242 
+ 243         cw.visit(CLASSFILE_VERSION, ACC_SUPER + ACC_FINAL + ACC_SYNTHETIC,
+ 244                  lambdaClassName, null,
+ 245                  JAVA_LANG_OBJECT, interfaces);
+ 246 
+ 247         // Generate final fields to be filled in by constructor
+ 248         for (int i = 0; i &lt; argDescs.length; i++) {
+ 249             FieldVisitor fv = cw.visitField(ACC_PRIVATE + ACC_FINAL,
+ 250                                             argNames[i],
+ 251                                             argDescs[i],
+ 252                                             null, null);
+ 253             fv.visitEnd();
+ 254         }
+ 255 
+ 256         generateConstructor();
+ 257         if (invokedType.parameterCount() == 0) {
+ 258             generateStaticField();
+ 259         } else {
+ 260             generateFactory();
+ 261         }
+ 262 
+ 263         // Forward the SAM method
+ 264         MethodVisitor mv = cw.visitMethod(ACC_PUBLIC, samMethodName,
+ 265                                           samMethodType.toMethodDescriptorString(), null, null);
+ 266         mv.visitAnnotation(DESCR_HIDDEN, true);
+ 267         new ForwardingMethodGenerator(mv).generate(samMethodType);
+ 268 
+ 269         // Forward the bridges
+ 270         if (additionalBridges != null) {
+ 271             for (MethodType mt : additionalBridges) {
+ 272                 mv = cw.visitMethod(ACC_PUBLIC|ACC_BRIDGE, samMethodName,
+ 273                                     mt.toMethodDescriptorString(), null, null);
+ 274                 mv.visitAnnotation(DESCR_HIDDEN, true);
+ 275                 new ForwardingMethodGenerator(mv).generate(mt);
+ 276             }
+ 277         }
+ 278 
+ 279         if (isSerializable)
+ 280             generateSerializationFriendlyMethods();
+ 281         else if (accidentallySerializable)
+ 282             generateSerializationHostileMethods();
+ 283 
+ 284         cw.visitEnd();
+ 285 
+ 286         // Define the generated class in this VM.
+ 287 
+ 288         final byte[] classBytes = cw.toByteArray();
+ 289 
+ 290         // If requested, dump out to a file for debugging purposes
+ 291         if (dumper != null) {
+ 292             AccessController.doPrivileged(new PrivilegedAction&lt;&gt;() {
+ 293                 @Override
+ 294                 public Void run() {
+ 295                     dumper.dumpClass(lambdaClassName, classBytes);
+ 296                     return null;
+ 297                 }
+ 298             }, null,
+ 299             new FilePermission("&lt;&lt;ALL FILES&gt;&gt;", "read, write"),
+ 300             // createDirectories may need it
+ 301             new PropertyPermission("user.dir", "read"));
+ 302         }
+ 303 
+ 304         return UNSAFE.defineAnonymousClass(targetClass, classBytes, null);
+ 305     }
+ 306 
+ 307     /**
+ 308      * Generate a static field that contains the singleton instance of the lambda
+ 309      */
+ 310     private void generateStaticField() {
+ 311         String lambdaTypeDescriptor = BytecodeDescriptor.unparse(invokedType.returnType());
+ 312 
+ 313         // Generate the static final field that holds the lambda singleton
+ 314         FieldVisitor fv = cw.visitField(ACC_PRIVATE | ACC_STATIC | ACC_FINAL, LAMBDA_INSTANCE_FIELD, lambdaTypeDescriptor, null, null);
+ 315         fv.visitEnd();
+ 316 
+ 317         // Instantiate the lambda and store it to the static final field
+ 318         MethodVisitor clinit = cw.visitMethod(ACC_STATIC, "&lt;clinit&gt;", "()V", null, null);
+ 319         clinit.visitCode();
+ 320 
+ 321         instantiateLambda(clinit);
+ 322         clinit.visitFieldInsn(PUTSTATIC, lambdaClassName, LAMBDA_INSTANCE_FIELD, lambdaTypeDescriptor);
+ 323 
+ 324         clinit.visitInsn(RETURN);
+ 325         clinit.visitMaxs(-1, -1);
+ 326         clinit.visitEnd();
+ 327     }
+ 328 
+ 329     /**
+ 330      * Generate the factory method for the class
+ 331      */
+ 332     private void generateFactory() {
+ 333         MethodVisitor m = cw.visitMethod(ACC_PRIVATE | ACC_STATIC, NAME_FACTORY, invokedType.toMethodDescriptorString(), null, null);
+ 334         m.visitCode();
+ 335 
+ 336         instantiateLambda(m);
+ 337         m.visitInsn(ARETURN);
+ 338 
+ 339         m.visitMaxs(-1, -1);
+ 340         m.visitEnd();
+ 341     }
+ 342 
+ 343     private void instantiateLambda(MethodVisitor m) {
+ 344         m.visitTypeInsn(NEW, lambdaClassName);
+ 345         m.visitInsn(Opcodes.DUP);
+ 346         for (int typeIndex = 0, varIndex = 0; typeIndex &lt; invokedType.parameterCount(); typeIndex++) {
+ 347             Class&lt;?&gt; argType = invokedType.parameterType(typeIndex);
+ 348             m.visitVarInsn(getLoadOpcode(argType), varIndex);
+ 349             varIndex += getParameterSize(argType);
+ 350         }
+ 351         m.visitMethodInsn(INVOKESPECIAL, lambdaClassName, NAME_CTOR, constructorType.toMethodDescriptorString(), false);
+ 352     }
+ 353 
+ 354     /**
+ 355      * Generate the constructor for the class
+ 356      */
+ 357     private void generateConstructor() {
+ 358         // Generate constructor
+ 359         MethodVisitor ctor = cw.visitMethod(ACC_PRIVATE, NAME_CTOR,
+ 360                                             constructorType.toMethodDescriptorString(), null, null);
+ 361         ctor.visitCode();
+ 362         ctor.visitVarInsn(ALOAD, 0);
+ 363         ctor.visitMethodInsn(INVOKESPECIAL, JAVA_LANG_OBJECT, NAME_CTOR,
+ 364                              METHOD_DESCRIPTOR_VOID, false);
+ 365         int parameterCount = invokedType.parameterCount();
+ 366         for (int i = 0, lvIndex = 0; i &lt; parameterCount; i++) {
+ 367             ctor.visitVarInsn(ALOAD, 0);
+ 368             Class&lt;?&gt; argType = invokedType.parameterType(i);
+ 369             ctor.visitVarInsn(getLoadOpcode(argType), lvIndex + 1);
+ 370             lvIndex += getParameterSize(argType);
+ 371             ctor.visitFieldInsn(PUTFIELD, lambdaClassName, argNames[i], argDescs[i]);
+ 372         }
+ 373         ctor.visitInsn(RETURN);
+ 374         // Maxs computed by ClassWriter.COMPUTE_MAXS, these arguments ignored
+ 375         ctor.visitMaxs(-1, -1);
+ 376         ctor.visitEnd();
+ 377     }
+ 378 
+ 379     /**
+ 380      * Generate a writeReplace method that supports serialization
+ 381      */
+ 382     private void generateSerializationFriendlyMethods() {
+ 383         TypeConvertingMethodAdapter mv
+ 384                 = new TypeConvertingMethodAdapter(
+ 385                     cw.visitMethod(ACC_PRIVATE + ACC_FINAL,
+ 386                     NAME_METHOD_WRITE_REPLACE, DESCR_METHOD_WRITE_REPLACE,
+ 387                     null, null));
+ 388 
+ 389         mv.visitCode();
+ 390         mv.visitTypeInsn(NEW, NAME_SERIALIZED_LAMBDA);
+ 391         mv.visitInsn(DUP);
+ 392         mv.visitLdcInsn(Type.getType(targetClass));
+ 393         mv.visitLdcInsn(invokedType.returnType().getName().replace('.', '/'));
+ 394         mv.visitLdcInsn(samMethodName);
+ 395         mv.visitLdcInsn(samMethodType.toMethodDescriptorString());
+ 396         mv.visitLdcInsn(implInfo.getReferenceKind());
+ 397         mv.visitLdcInsn(implInfo.getDeclaringClass().getName().replace('.', '/'));
+ 398         mv.visitLdcInsn(implInfo.getName());
+ 399         mv.visitLdcInsn(implInfo.getMethodType().toMethodDescriptorString());
+ 400         mv.visitLdcInsn(instantiatedMethodType.toMethodDescriptorString());
+ 401         mv.iconst(argDescs.length);
+ 402         mv.visitTypeInsn(ANEWARRAY, JAVA_LANG_OBJECT);
+ 403         for (int i = 0; i &lt; argDescs.length; i++) {
+ 404             mv.visitInsn(DUP);
+ 405             mv.iconst(i);
+ 406             mv.visitVarInsn(ALOAD, 0);
+ 407             mv.visitFieldInsn(GETFIELD, lambdaClassName, argNames[i], argDescs[i]);
+ 408             mv.boxIfTypePrimitive(Type.getType(argDescs[i]));
+ 409             mv.visitInsn(AASTORE);
+ 410         }
+ 411         mv.visitMethodInsn(INVOKESPECIAL, NAME_SERIALIZED_LAMBDA, NAME_CTOR,
+ 412                 DESCR_CTOR_SERIALIZED_LAMBDA, false);
+ 413         mv.visitInsn(ARETURN);
+ 414         // Maxs computed by ClassWriter.COMPUTE_MAXS, these arguments ignored
+ 415         mv.visitMaxs(-1, -1);
+ 416         mv.visitEnd();
+ 417     }
+ 418 
+ 419     /**
+ 420      * Generate a readObject/writeObject method that is hostile to serialization
+ 421      */
+ 422     private void generateSerializationHostileMethods() {
+ 423         MethodVisitor mv = cw.visitMethod(ACC_PRIVATE + ACC_FINAL,
+ 424                                           NAME_METHOD_WRITE_OBJECT, DESCR_METHOD_WRITE_OBJECT,
+ 425                                           null, SER_HOSTILE_EXCEPTIONS);
+ 426         mv.visitCode();
+ 427         mv.visitTypeInsn(NEW, NAME_NOT_SERIALIZABLE_EXCEPTION);
+ 428         mv.visitInsn(DUP);
+ 429         mv.visitLdcInsn("Non-serializable lambda");
+ 430         mv.visitMethodInsn(INVOKESPECIAL, NAME_NOT_SERIALIZABLE_EXCEPTION, NAME_CTOR,
+ 431                            DESCR_CTOR_NOT_SERIALIZABLE_EXCEPTION, false);
+ 432         mv.visitInsn(ATHROW);
+ 433         mv.visitMaxs(-1, -1);
+ 434         mv.visitEnd();
+ 435 
+ 436         mv = cw.visitMethod(ACC_PRIVATE + ACC_FINAL,
+ 437                             NAME_METHOD_READ_OBJECT, DESCR_METHOD_READ_OBJECT,
+ 438                             null, SER_HOSTILE_EXCEPTIONS);
+ 439         mv.visitCode();
+ 440         mv.visitTypeInsn(NEW, NAME_NOT_SERIALIZABLE_EXCEPTION);
+ 441         mv.visitInsn(DUP);
+ 442         mv.visitLdcInsn("Non-serializable lambda");
+ 443         mv.visitMethodInsn(INVOKESPECIAL, NAME_NOT_SERIALIZABLE_EXCEPTION, NAME_CTOR,
+ 444                            DESCR_CTOR_NOT_SERIALIZABLE_EXCEPTION, false);
+ 445         mv.visitInsn(ATHROW);
+ 446         mv.visitMaxs(-1, -1);
+ 447         mv.visitEnd();
+ 448     }
+ 449 
+ 450     /**
+ 451      * This class generates a method body which calls the lambda implementation
+ 452      * method, converting arguments, as needed.
+ 453      */
+ 454     private class ForwardingMethodGenerator extends TypeConvertingMethodAdapter {
+ 455 
+ 456         ForwardingMethodGenerator(MethodVisitor mv) {
+ 457             super(mv);
+ 458         }
+ 459 
+ 460         void generate(MethodType methodType) {
+ 461             visitCode();
+ 462 
+ 463             if (implKind == MethodHandleInfo.REF_newInvokeSpecial) {
+ 464                 visitTypeInsn(NEW, implMethodClassName);
+ 465                 visitInsn(DUP);
+ 466             }
+ 467             for (int i = 0; i &lt; argNames.length; i++) {
+ 468                 visitVarInsn(ALOAD, 0);
+ 469                 visitFieldInsn(GETFIELD, lambdaClassName, argNames[i], argDescs[i]);
+ 470             }
+ 471 
+ 472             convertArgumentTypes(methodType);
+ 473 
+ 474             // Invoke the method we want to forward to
+ 475             visitMethodInsn(invocationOpcode(), implMethodClassName,
+ 476                             implMethodName, implMethodDesc,
+ 477                             implClass.isInterface());
+ 478 
+ 479             // Convert the return value (if any) and return it
+ 480             // Note: if adapting from non-void to void, the 'return'
+ 481             // instruction will pop the unneeded result
+ 482             Class&lt;?&gt; implReturnClass = implMethodType.returnType();
+ 483             Class&lt;?&gt; samReturnClass = methodType.returnType();
+ 484             convertType(implReturnClass, samReturnClass, samReturnClass);
+ 485             visitInsn(getReturnOpcode(samReturnClass));
+ 486             // Maxs computed by ClassWriter.COMPUTE_MAXS,these arguments ignored
+ 487             visitMaxs(-1, -1);
+ 488             visitEnd();
+ 489         }
+ 490 
+ 491         private void convertArgumentTypes(MethodType samType) {
+ 492             int lvIndex = 0;
+ 493             int samParametersLength = samType.parameterCount();
+ 494             int captureArity = invokedType.parameterCount();
+ 495             for (int i = 0; i &lt; samParametersLength; i++) {
+ 496                 Class&lt;?&gt; argType = samType.parameterType(i);
+ 497                 visitVarInsn(getLoadOpcode(argType), lvIndex + 1);
+ 498                 lvIndex += getParameterSize(argType);
+ 499                 convertType(argType, implMethodType.parameterType(captureArity + i), instantiatedMethodType.parameterType(i));
+ 500             }
+ 501         }
+ 502 
+ 503         private int invocationOpcode() throws InternalError {
+ 504             switch (implKind) {
+ 505                 case MethodHandleInfo.REF_invokeStatic:
+ 506                     return INVOKESTATIC;
+ 507                 case MethodHandleInfo.REF_newInvokeSpecial:
+ 508                     return INVOKESPECIAL;
+ 509                  case MethodHandleInfo.REF_invokeVirtual:
+ 510                     return INVOKEVIRTUAL;
+ 511                 case MethodHandleInfo.REF_invokeInterface:
+ 512                     return INVOKEINTERFACE;
+ 513                 case MethodHandleInfo.REF_invokeSpecial:
+ 514                     return INVOKESPECIAL;
+ 515                 default:
+ 516                     throw new InternalError("Unexpected invocation kind: " + implKind);
+ 517             }
+ 518         }
+ 519     }
+ 520 
+ 521     static int getParameterSize(Class&lt;?&gt; c) {
+ 522         if (c == Void.TYPE) {
+ 523             return 0;
+ 524         } else if (c == Long.TYPE || c == Double.TYPE) {
+ 525             return 2;
+ 526         }
+ 527         return 1;
+ 528     }
+ 529 
+ 530     static int getLoadOpcode(Class&lt;?&gt; c) {
+ 531         if(c == Void.TYPE) {
+ 532             throw new InternalError("Unexpected void type of load opcode");
+ 533         }
+ 534         return ILOAD + getOpcodeOffset(c);
+ 535     }
+ 536 
+ 537     static int getReturnOpcode(Class&lt;?&gt; c) {
+ 538         if(c == Void.TYPE) {
+ 539             return RETURN;
+ 540         }
+ 541         return IRETURN + getOpcodeOffset(c);
+ 542     }
+ 543 
+ 544     private static int getOpcodeOffset(Class&lt;?&gt; c) {
+ 545         if (c.isPrimitive()) {
+ 546             if (c == Long.TYPE) {
+ 547                 return 1;
+ 548             } else if (c == Float.TYPE) {
+ 549                 return 2;
+ 550             } else if (c == Double.TYPE) {
+ 551                 return 3;
+ 552             }
+ 553             return 0;
+ 554         } else {
+ 555             return 4;
+ 556         }
+ 557     }
+ 558 
+ 559 }
+</pre></body></html>
